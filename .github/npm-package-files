@@ -9,6 +9,7 @@ extensions/anthropic-compat/protocol.ts
 extensions/anthropic-compat/runtime.ts
 extensions/anthropic-compat/settings.ts
 extensions/anthropic-compat/tail.ts
+extensions/anthropic-compat/transport.ts
 extensions/index.ts
 extensions/settings-menu.ts
 extensions/settings-session.ts

@@ -38,6 +38,7 @@ import {
   template,
 } from "./protocol.ts";
 import { loadSessionConfig, registerSettings } from "./settings.ts";
+import { finalizeRequest, type AnthropicTransport } from "./transport.ts";
 import {
   REQUEST_TYPE,
   bindingTemplate,
@@ -50,6 +51,10 @@ import {
 } from "./tail.ts";
 
 const anthropic = anthropicMessagesApi();
+const builtinTransport: AnthropicTransport = (model, messages, options) => {
+  if (!anthropicModel(model)) throw new Error("Expected Anthropic Messages API.");
+  return anthropic.streamSimple(model, messages, options);
+};
 
 /**
  * Serialize a request through Pi's Anthropic adapter without sending it. With `nonStrict`, the
@@ -58,6 +63,7 @@ const anthropic = anthropicMessagesApi();
  * tools, Pi does not retry and the first serialization is already non-strict.
  */
 async function prepareRequest(
+  transport: AnthropicTransport,
   model: Model<"anthropic-messages">,
   context: TranscriptContext,
   options: SimpleStreamOptions,
@@ -65,28 +71,26 @@ async function prepareRequest(
 ): Promise<Request> {
   let prepared: Request | undefined;
   let rejected = false;
-  await anthropic
-    .streamSimple(model, context, {
-      ...options,
-      maxRetries: 0,
-      fetch: (input, init) => {
-        prepared = new Request(input, init);
-        if (nonStrict && !rejected) {
-          rejected = true;
-          return Promise.resolve(
-            Response.json(
-              {
-                type: "error",
-                error: { type: "invalid_request_error", message: STRICT_TOOL_LIMIT_MESSAGES[1] },
-              },
-              { status: 400 },
-            ),
-          );
-        }
-        return Promise.reject(new Error("Native request prepared without transmission."));
-      },
-    })
-    .result();
+  await transport(model, context, {
+    ...options,
+    maxRetries: 0,
+    fetch: (input, init) => {
+      prepared = new Request(input, init);
+      if (nonStrict && !rejected) {
+        rejected = true;
+        return Promise.resolve(
+          Response.json(
+            {
+              type: "error",
+              error: { type: "invalid_request_error", message: STRICT_TOOL_LIMIT_MESSAGES[1] },
+            },
+            { status: 400 },
+          ),
+        );
+      }
+      return Promise.reject(new Error("Native request prepared without transmission."));
+    },
+  }).result();
   options.signal?.throwIfAborted();
   if (!prepared) throw new Error("Could not serialize the Anthropic compaction request.");
   return prepared;
@@ -209,6 +213,10 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
   let config: Config | undefined;
   let transform: SimpleStreamOptions["onPayload"];
   let transformModel: string | undefined;
+  // Resolve after every extension has registered. Never replace an OAuth wrapper
+  // with the bare adapter, and never route serialization back through ourselves.
+  let transport: AnthropicTransport = builtinTransport;
+  const delegates = new WeakMap<AnthropicTransport, AnthropicTransport>();
 
   const configuration = (ctx: Parameters<typeof loadSessionConfig>[0]): Config => {
     config ??= loadSessionConfig(ctx);
@@ -223,6 +231,59 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
   pi.on("session_start", (_event, ctx) => {
     reset();
     context = ctx;
+    const registered = ctx.modelRegistry.getRegisteredProviderConfig("anthropic");
+    const selected = registered?.streamSimple ?? builtinTransport;
+    transport = delegates.get(selected) ?? selected;
+    const delegate = transport;
+    const composed: AnthropicTransport = (model, messages, options) => {
+      if (!anthropicModel(model)) throw new Error("Expected Anthropic Messages API.");
+      const ctx = context;
+      const agentTurn =
+        ctx && eligibleModel(model) && options?.sessionId === ctx.sessionManager.getSessionId();
+      if (!agentTurn) return delegate(model, messages, options);
+      transform = options?.onPayload;
+      transformModel = model.id;
+      const send = options?.fetch ?? fetcher;
+      return delegate(model, messages, {
+        ...options,
+        // The auth transport owns onPayload and its fetch-level version checks.
+        // Its final fetch delegates here, after all shaping has completed.
+        fetch: async (input, init) => {
+          const request = new Request(input, init);
+          const url = new URL(request.url);
+          if (
+            request.method !== "POST" ||
+            url.origin !== "https://api.anthropic.com" ||
+            url.pathname !== "/v1/messages"
+          )
+            return send(request);
+          const transformed = object(await request.clone().json());
+          const branch = ctx.sessionManager.getBranch();
+          const nextTemplate = template(transformed);
+          const current = configuration(ctx);
+          const final = replay(
+            current.enabled && current.keepRecentTokens > 0
+              ? enforceThinking(transformed)
+              : transformed,
+            activeCheckpoint(branch),
+          );
+          const anchor = ctx.sessionManager.getLeafId();
+          const response = await send(finalizeRequest(request, final));
+          // Rejected attempts must not become request boundaries. Auth can safely
+          // learn a version floor and send another attempt through this seam.
+          if (response.ok) {
+            const saved = activeTemplate(ctx.sessionManager.getBranch(), model.id);
+            if (JSON.stringify(saved) !== JSON.stringify(nextTemplate)) {
+              pi.appendEntry(TEMPLATE_TYPE, nextTemplate);
+            }
+            if (anchor) pi.appendEntry(REQUEST_TYPE, requestBoundary(final, anchor));
+          }
+          return response;
+        },
+      });
+    };
+    delegates.set(composed, delegate);
+    pi.registerProvider("anthropic", { api: "anthropic-messages", streamSimple: composed });
   });
   pi.on("session_shutdown", reset);
   pi.on("session_tree", (_event, ctx) => {
@@ -243,54 +304,6 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
     context = ctx;
     if (!eligibleModel(ctx.model) || !activeCheckpoint(ctx.sessionManager.getBranch())) return;
     return { messages: event.messages.filter((message) => message.role !== "compactionSummary") };
-  });
-
-  pi.registerProvider("anthropic", {
-    api: "anthropic-messages",
-    streamSimple: (model, messages, options) => {
-      if (!anthropicModel(model)) throw new Error("Expected Anthropic Messages API.");
-      // Pi can serialize a turn twice: after a strict-tool-limit rejection it retries once with
-      // preferred strict tools non-strict. Only the request Anthropic accepts is recorded.
-      let record: (() => void) | undefined;
-      return anthropic.streamSimple(model, messages, {
-        ...options,
-        onPayload: async (payload, selected) => {
-          record = undefined;
-          const updated = await options?.onPayload?.(payload, selected);
-          const transformed = object(updated === undefined ? payload : updated);
-          const ctx = context;
-          if (!ctx || !eligibleModel(model)) return transformed;
-          // One-off summaries and other extensions' nested calls are not agent turns.
-          if (options?.sessionId !== ctx.sessionManager.getSessionId()) return transformed;
-          transform = options?.onPayload;
-          transformModel = model.id;
-          const branch = ctx.sessionManager.getBranch();
-          const nextTemplate = template(transformed);
-          const current = configuration(ctx);
-          const final = replay(
-            current.enabled && current.keepRecentTokens > 0
-              ? enforceThinking(transformed)
-              : transformed,
-            activeCheckpoint(branch),
-          );
-          const anchor = ctx.sessionManager.getLeafId();
-          record = () => {
-            const saved = activeTemplate(ctx.sessionManager.getBranch(), model.id);
-            if (JSON.stringify(saved) !== JSON.stringify(nextTemplate)) {
-              pi.appendEntry(TEMPLATE_TYPE, nextTemplate);
-            }
-            if (anchor) pi.appendEntry(REQUEST_TYPE, requestBoundary(final, anchor));
-          };
-          return final;
-        },
-        onResponse: async (response, selected) => {
-          const accepted = record;
-          record = undefined;
-          accepted?.();
-          await options?.onResponse?.(response, selected);
-        },
-      });
-    },
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -367,6 +380,7 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
       // Serialize without transmission, then select only a proven earlier request.
       const serialize = async (nonStrict: boolean) => {
         const request = await prepareRequest(
+          transport,
           requestModel,
           normalizeContext({ messages }),
           serializationOptions,
@@ -395,6 +409,7 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
         const keptMessages = withoutHiddenTools(convertToLlm(selection.keptMessages), hidden);
         requireCompletedTools(keptMessages);
         const tailRequest = await prepareRequest(
+          transport,
           requestModel,
           compactedTranscript(messages, keptMessages),
           tailSerializationOptions,
@@ -452,6 +467,7 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
       signal.throwIfAborted();
       if (selection) {
         const verification = await prepareRequest(
+          transport,
           requestModel,
           normalizeContext({ messages }),
           serializationOptions,

@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Compose with an Anthropic OAuth transport registered by another extension, such as
+  `@gotgenes/pi-anthropic-auth` for Claude subscriptions. At session start the extension now
+  delegates to the transport already registered for `anthropic` instead of replacing it with the
+  bare Anthropic adapter, which had dropped the subscription request shaping and made ordinary
+  turns fail with HTTP 400. Request templates and checkpoint replay apply at the delegate's final
+  `fetch`, after all shaping, and replay beta flags are moved into the `anthropic-beta` header
+  while the request's authentication, signal and other headers are kept. Restarting the session
+  unwraps the extension's own earlier wrapper instead of nesting it.
+
 ## [0.0.11] - 2026-10-15
 
 ### Changed
